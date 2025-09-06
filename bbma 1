@@ -1,0 +1,168 @@
+//+------------------------------------------------------------------+ //|                                                EA BBMA Single TF | //|                                       Smart Adaptive (v0.9 beta) | //|                                     © 2025 Investasi EA Workshop | //+------------------------------------------------------------------+ #property strict #property copyright "© 2025 Investasi EA" #property link      ""
+
+// ===================== USER INPUTS ===================== input string   Inp__General____              = "==== GENERAL ===="; input bool     EnableEA                      = true; input ENUM_TIMEFRAMES WorkTF                 = PERIOD_H1;  // Single TF kerja input int      Magic                         = 250906;     // Magic number input double   RiskPerTradePct               = 1.0;        // % risk normal per trade input double   ZZLRiskMultiplier             = 2.0;        // 2x-3x risk untuk ZZL input double   MaxDailyLossPct               = 5.0;        // stop trading jika loss harian >= % input int      MaxConsecutiveLoss            = 4;          // hentikan jika kalah berturut2
+
+input string   Inp__Indicators____           = "==== INDICATORS ===="; input int      BB_Period                     = 20; input double   BB_Deviation                  = 2.0; input int      MA5_Period                    = 5; input int      MA10_Period                   = 10; input int      EMA50_Period                  = 50; input int      EMA200_Period                 = 200; input int      ATR_Period                    = 14; input double   ATR_Mult_SLBuffer             = 1.0;        // buffer SL dinamis (0..1.5)
+
+input string   Inp__Filters____              = "==== FILTERS ===="; input bool     UseATRFilter                  = true;       // validasi momentum vs volatilitas input double   MinCSABodyATR                 = 0.7;        // min body CSA = 0.7*ATR input bool     UseBBSlopeFilter              = true;       // pastikan trending utk momentum/ZZL input double   MinBBSlopePoints              = 5.0;        // kemiringan min (points) antara midBB[1] & midBB[20]
+
+input string   Inp__News____                 = "==== NEWS FILTER ===="; input bool     UseNewsFilter                 = true;       // pause menjelang news input int      MinutesBeforeNews             = 30; input int      MinutesAfterNews              = 30; input string   NewsTimesCSV                  = "";         // format: YYYY.MM.DD HH:MM;YYYY.MM.DD HH:MM;...
+
+input string   Inp__Exits____                = "==== EXIT & TRAILING ===="; input bool     UseTrailingATR                = true; input double   ATR_TrailMultiplier           = 1.2;        // trailing = ATR*multiplier input bool     UseTimeBasedExit              = true; input int      MaxBarsHold                   = 96;         // fail-safe exit setelah X bar
+
+input string   Inp__Modes____                = "==== MODES ===="; enum TradeMode { SAFE=0, HYBRID=1, AGGRESSIVE=2 }; input TradeMode Mode                          = HYBRID;
+
+// ===================== GLOBALS ===================== datetime        lastBarTime = 0; int             consecLoss = 0; double          dayStartEquity = 0; dateTime        dayStamp = 0;
+
+// Order ticket holder int             ticketBuy  = -1; int             ticketSell = -1;
+
+// Utility structure for signals struct Signal { bool  buy; bool  sell; string setup;  // "REENTRY", "MOMENTUM_CAK", "MHV", "ZZL" double sl; double tp; double lot; };
+
+// ===================== HELPER FUNCTIONS ===================== bool IsNewBar() { datetime t = iTime(_Symbol, WorkTF, 0); if(t!=lastBarTime) { lastBarTime=t; return true; } return false; }
+
+void ResetDailyEquityIfNeeded(){ MqlDateTime mt; TimeToStruct(TimeCurrent(), mt); if(dayStamp==0 || mt.day!=TimeDay(dayStamp)){ dayStamp = TimeCurrent(); dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY); consecLoss = 0; } }
+
+bool DailyLossHit(){ if(MaxDailyLossPct<=0) return false; double eq = AccountInfoDouble(ACCOUNT_EQUITY); double dd = 100.0*(dayStartEquity - eq)/MathMax(1e-6, dayStartEquity); return (dd >= MaxDailyLossPct); }
+
+bool IsWithinNewsWindow(){ if(!UseNewsFilter || StringLen(NewsTimesCSV)==0) return false; // parse CSV semicolon-separated datetime strings: "YYYY.MM.DD HH:MM;..." int parts = StringSplit(NewsTimesCSV,';',NULL); string arr[]; int n = StringSplit(NewsTimesCSV,';',arr); datetime now = TimeCurrent(); for(int i=0;i<n;i++){ string s = StringTrim(arr[i]); if(StringLen(s)<5) continue; datetime nt = StringToTime(s); if(nt==0) continue; if( (now >= (nt - MinutesBeforeNews60)) && (now <= (nt + MinutesAfterNews60)) ) return true; } return false; }
+
+// Indicator getters void GetBB(int shift,double &upper,double &middle,double &lower){ upper  = iBands(_Symbol,WorkTF,BB_Period,0,BB_Deviation,PRICE_CLOSE,MODE_UPPER,shift); middle = iBands(_Symbol,WorkTF,BB_Period,0,BB_Deviation,PRICE_CLOSE,MODE_MAIN, shift); lower  = iBands(_Symbol,WorkTF,BB_Period,0,BB_Deviation,PRICE_CLOSE,MODE_LOWER,shift); }
+
+double MA(int period,int shift,int ma_method=MODE_EMA,int price=PRICE_CLOSE){ return iMA(_Symbol,WorkTF,period,0,ma_method,price,shift); }
+
+double ATR(int shift){ return iATR(_Symbol,WorkTF,ATR_Period,shift); }
+
+bool BBSlopeTrending(){ if(!UseBBSlopeFilter) return true; double m0, m20, u,l; GetBB(0,u,m0,l); double m20s; GetBB(20,u,m20s,l); double slope = MathAbs(m0 - m20s)/_Point; // points return (slope >= MinBBSlopePoints); }
+
+bool CSABodyIsStrong(int shift){ if(!UseATRFilter) return true; double atr = ATR(shift); double open = iOpen(_Symbol,WorkTF,shift); double close = iClose(_Symbol,WorkTF,shift); double body = MathAbs(close-open); return (body >= MinCSABodyATR*atr); }
+
+// Utility: last swing high/low indexes in window int LastSwingHighIndex(int lookback=10){ int idx=1; double maxh = iHigh(_Symbol,WorkTF,1); int maxi=1; for(idx=1; idx<=lookback; idx++){ double h = iHigh(_Symbol,WorkTF,idx); if(h>maxh){ maxh=h; maxi=idx; } } return maxi; } int LastSwingLowIndex(int lookback=10){ int idx=1; double minl = iLow(_Symbol,WorkTF,1); int mini=1; for(idx=1; idx<=lookback; idx++){ double l = iLow(_Symbol,WorkTF,idx); if(l<minl){ minl=l; mini=idx; } } return mini; }
+
+// Calculate lot by risk and SL distance double LotsByRisk(double riskPct,double slPrice){ double accEq = AccountInfoDouble(ACCOUNT_EQUITY); double riskMoney = accEq * (riskPct/100.0); double price = SymbolInfoDouble(_Symbol,SYMBOL_BID); double tickValue = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE); double tickSize  = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE); double contract  = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_CONTRACT_SIZE);
+
+double slDist = MathAbs(price - slPrice); double ticks  = slDist / MathMax(tickSize,1e-6); if(ticks<=0) return 0.0; double moneyPerLotPerTick = (contract * tickSize / price) * tickValue; // approximation double lots = riskMoney / (ticks * MathMax(moneyPerLotPerTick,1e-6)); double minLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN); double maxLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX); double step   = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP); lots = MathFloor(lots/step)*step; lots = MathMax(minLot, MathMin(maxLot, lots)); return lots; }
+
+bool HasOpenPosition(){ for(int i=OrdersTotal()-1;i>=0;i--){ if(OrderSelect(i,SELECT_BY_POS,MODE_TRADES)){ if(OrderSymbol()==_Symbol && OrderMagicNumber()==Magic) return true; } } return false; }
+
+int CountOpenDirection(int type){ int c=0; for(int i=OrdersTotal()-1;i>=0;i--){ if(OrderSelect(i,SELECT_BY_POS,MODE_TRADES)){ if(OrderSymbol()==_Symbol && OrderMagicNumber()==Magic && OrderType()==type) c++; } } return c; }
+
+void CloseAllMagic(){ for(int i=OrdersTotal()-1;i>=0;i--){ if(OrderSelect(i,SELECT_BY_POS,MODE_TRADES)){ if(OrderSymbol()==_Symbol && OrderMagicNumber()==Magic){ if(OrderType()==OP_BUY)  OrderClose(OrderTicket(),OrderLots(),Bid,3); if(OrderType()==OP_SELL) OrderClose(OrderTicket(),OrderLots(),Ask,3); } } } }
+
+// ===================== SETUP DETECTION ===================== // Helpers for MA5/10 and EMA50/200 void GetCoreMAs(int shift,double &ma5H,double &ma5L,double &ma10H,double &ma10L,double &ema50,double &ema200){ ma5H  = iMA(_Symbol,WorkTF,MA5_Period,0,MODE_EMA,PRICE_HIGH,shift); ma5L  = iMA(_Symbol,WorkTF,MA5_Period,0,MODE_EMA,PRICE_LOW, shift); ma10H = iMA(_Symbol,WorkTF,MA10_Period,0,MODE_EMA,PRICE_HIGH,shift); ma10L = iMA(_Symbol,WorkTF,MA10_Period,0,MODE_EMA,PRICE_LOW, shift); ema50 = iMA(_Symbol,WorkTF,EMA50_Period,0,MODE_EMA,PRICE_CLOSE,shift); ema200= iMA(_Symbol,WorkTF,EMA200_Period,0,MODE_EMA,PRICE_CLOSE,shift); }
+
+// Detect Momentum CSA/CSM (for CAK rule) bool IsBullCSA(int shift){ double o=iOpen(_Symbol,WorkTF,shift), c=iClose(_Symbol,WorkTF,shift); return c>o && CSABodyIsStrong(shift);} bool IsBearCSA(int shift){ double o=iOpen(_Symbol,WorkTF,shift), c=iClose(_Symbol,WorkTF,shift); return c<o && CSABodyIsStrong(shift);}
+
+// Reentry detection: pullback to MA5/10 after momentum bool DetectReentryBuy(){ // condition: previous saw momentum up, price pullback to MA5/10 and close up double ma5H,ma5L,ma10H,ma10L,ema50,ema200; GetCoreMAs(1,ma5H,ma5L,ma10H,ma10L,ema50,ema200); double close1 = iClose(_Symbol,WorkTF,1), open1 = iOpen(_Symbol,WorkTF,1); double mid0, up0, lo0; GetBB(1,up0,mid0,lo0); bool hadCSAUp = IsBullCSA(2) || IsBullCSA(3); bool pullback = (iLow(_Symbol,WorkTF,1) <= ma5L || iLow(_Symbol,WorkTF,1) <= ma10L); bool closeUp  = (close1>open1); bool aboveEMA50 = (close1>ema50); return (hadCSAUp && pullback && closeUp && aboveEMA50); }
+
+bool DetectReentrySell(){ double ma5H,ma5L,ma10H,ma10L,ema50,ema200; GetCoreMAs(1,ma5H,ma5L,ma10H,ma10L,ema50,ema200); double close1 = iClose(_Symbol,WorkTF,1), open1 = iOpen(_Symbol,WorkTF,1); bool hadCSADn = IsBearCSA(2) || IsBearCSA(3); bool pullback = (iHigh(_Symbol,WorkTF,1) >= ma5H || iHigh(_Symbol,WorkTF,1) >= ma10H); bool closeDn  = (close1<open1); bool belowEMA50 = (close1<ema50); return (hadCSADn && pullback && closeDn && belowEMA50); }
+
+// Momentum-CAK: entry only after reentry occurs following a CSA bool DetectMomentumCAKBuy(){ // last bar is reentry buy AND we had CSA up before return DetectReentryBuy(); } bool DetectMomentumCAKSell(){ return DetectReentrySell(); }
+
+// MHV: entry at open of reverse candle after extreme (simplified) bool DetectMHVBuy(){ // extreme down -> reverse up candle at open level double up,mid,low; GetBB(1,up,mid,low); bool extremeDown = (iLow(_Symbol,WorkTF,1) < low && iClose(_Symbol,WorkTF,1) > iOpen(_Symbol,WorkTF,1)); // entry next bar open if previous was first reverse return extremeDown; }
+
+bool DetectMHVSell(){ double up,mid,low; GetBB(1,up,mid,low); bool extremeUp = (iHigh(_Symbol,WorkTF,1) > up && iClose(_Symbol,WorkTF,1) < iOpen(_Symbol,WorkTF,1)); return extremeUp; }
+
+// ZZL: price + MA5/10 + MidBB on same side of EMA50 (zone selamat) bool DetectZZLBuy(){ double up,mid,low; GetBB(1,up,mid,low); double ma5H,ma5L,ma10H,ma10L,ema50,ema200; GetCoreMAs(1,ma5H,ma5L,ma10H,ma10L,ema50,ema200); double c1 = iClose(_Symbol,WorkTF,1); if(!BBSlopeTrending()) return false; return (c1>ema50 && ma5H>ema50 && ma10H>ema50 && mid>ema50); }
+
+bool DetectZZLSell(){ double up,mid,low; GetBB(1,up,mid,low); double ma5H,ma5L,ma10H,ma10L,ema50,ema200; GetCoreMAs(1,ma5H,ma5L,ma10H,ma10L,ema50,ema200); double c1 = iClose(_Symbol,WorkTF,1); if(!BBSlopeTrending()) return false; return (c1<ema50 && ma5L<ema50 && ma10L<ema50 && mid<ema50); }
+
+// ===================== SL/TP CALC RULES ===================== void CalcSLTP_Reentry(bool isBuy,double &sl,double &tp){ double up,mid,low; GetBB(1,up,mid,low); if(isBuy){ sl = low - ATR_Mult_SLBufferATR(1); // TP1 = High sebelum pullback -> use last swing high index int sh = LastSwingHighIndex(10); tp = iHigh(_Symbol,WorkTF,sh); } else { sl = up + ATR_Mult_SLBufferATR(1); int slw = LastSwingLowIndex(10); tp = iLow(_Symbol,WorkTF,slw); } }
+
+void CalcSLTP_Momentum(bool isBuy,double &sl,double &tp){ // SL = shadow candle momentum (bar 1 assumed reentry after CSAK, we approximate with bar2 CSA) int idxCSA = 2; // heuristic if(isBuy){ double lowCSA = iLow(_Symbol,WorkTF,idxCSA); sl = lowCSA - ATR_Mult_SLBufferATR(idxCSA); // TP1 = RR 1:2 double entry = iClose(_Symbol,WorkTF,1); tp = entry + 2.0(entry - sl); } else { double highCSA = iHigh(_Symbol,WorkTF,idxCSA); sl = highCSA + ATR_Mult_SLBufferATR(idxCSA); double entry = iClose(_Symbol,WorkTF,1); tp = entry - 2.0(sl - entry); } }
+
+void CalcSLTP_MHV(bool isBuy,double &sl,double &tp){ // SL = di luar pola M/W -> approx with last swing extreme if(isBuy){ int slw = LastSwingLowIndex(10); sl = iLow(_Symbol,WorkTF,slw) - ATR_Mult_SLBufferATR(slw); // TP1 MidBB / EMA50 (use the larger distance) double up,mid,low; GetBB(1,up,mid,low); double ema50 = MA(EMA50_Period,1); tp = MathMax(mid, ema50); } else { int sh  = LastSwingHighIndex(10); sl = iHigh(_Symbol,WorkTF,sh) + ATR_Mult_SLBufferATR(sh); double up,mid,low; GetBB(1,up,mid,low); double ema50 = MA(EMA50_Period,1); tp = MathMin(mid, ema50); } }
+
+void CalcSLTP_ZZL(bool isBuy,double &sl,double &tp){ double up,mid,low; GetBB(1,up,mid,low); if(isBuy){ sl = low - ATR_Mult_SLBufferATR(1); // TP1 = High sebelum pullback reentry ke-2 -> approx with last swing high in wider window int sh = LastSwingHighIndex(20); tp = iHigh(_Symbol,WorkTF,sh); } else { sl = up + ATR_Mult_SLBufferATR(1); int slw = LastSwingLowIndex(20); tp = iLow(_Symbol,WorkTF,slw); } }
+
+// ===================== SIGNAL BUILDER ===================== Signal BuildSignal(){ Signal s; s.buy=false; s.sell=false; s.setup=""; s.sl=0; s.tp=0; s.lot=0; if(!EnableEA) return s; if(IsWithinNewsWindow()) return s; // no new entries around news if(DailyLossHit()) return s; if(consecLoss>=MaxConsecutiveLoss) return s;
+
+// Mode filter bool allowMHV = (Mode!=SAFE); bool allowMomentum = (Mode!=SAFE); bool allowZZL = (Mode==AGGRESSIVE || Mode==HYBRID);
+
+// Priority: ZZL > Momentum-CAK > Reentry > MHV (you can reorder if needed) if(allowZZL){ if(DetectZZLBuy()) { CalcSLTP_ZZL(true,s.sl,s.tp); s.buy=true; s.setup="ZZL"; } else if(DetectZZLSell()) { CalcSLTP_ZZL(false,s.sl,s.tp); s.sell=true; s.setup="ZZL"; } } if(!s.buy && !s.sell && allowMomentum){ if(DetectMomentumCAKBuy()) { CalcSLTP_Momentum(true,s.sl,s.tp); s.buy=true; s.setup="MOMENTUM_CAK"; } else if(DetectMomentumCAKSell()) { CalcSLTP_Momentum(false,s.sl,s.tp); s.sell=true; s.setup="MOMENTUM_CAK"; } } if(!s.buy && !s.sell){ if(DetectReentryBuy()) { CalcSLTP_Reentry(true,s.sl,s.tp); s.buy=true; s.setup="REENTRY"; } else if(DetectReentrySell()) { CalcSLTP_Reentry(false,s.sl,s.tp); s.sell=true; s.setup="REENTRY"; } } if(!s.buy && !s.sell && allowMHV){ if(DetectMHVBuy()) { CalcSLTP_MHV(true,s.sl,s.tp); s.buy=true; s.setup="MHV"; } else if(DetectMHVSell()) { CalcSLTP_MHV(false,s.sl,s.tp); s.sell=true; s.setup="MHV"; } }
+
+if(s.buy||s.sell){ // Risk & lot double risk = RiskPerTradePct; if(s.setup=="ZZL") risk *= ZZLRiskMultiplier; double entry = iClose(_Symbol,WorkTF,1); s.lot = LotsByRisk(risk, s.sl); } return s; }
+
+// ===================== ORDER MANAGEMENT ===================== void TryOpen(Signal s){ if(!s.buy && !s.sell) return; if(HasOpenPosition()) return;
+
+double price = s.buy ? Ask : Bid; double sl = s.sl; double tp = s.tp; double lot = s.lot; if(lot<=0) return;
+
+int type = s.buy?OP_BUY:OP_SELL; int tk = OrderSend(_Symbol,type,lot,price,3,(s.buy?sl:sl),(s.buy?tp:tp),s.setup,Magic,0,clrAqua); if(tk>0){ Print("Opened ", (s.buy?"BUY":"SELL"), " ", s.setup, " lot=", DoubleToString(lot,2)); } else { Print("OrderSend failed ",GetLastError()); } }
+
+void ManageOpenPositions(){ for(int i=OrdersTotal()-1;i>=0;i--){ if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue; if(OrderSymbol()!=_Symbol || OrderMagicNumber()!=Magic) continue;
+
+int    type   = OrderType();
+  double open   = OrderOpenPrice();
+  double lots   = OrderLots();
+  double sl     = OrderStopLoss();
+  double tp     = OrderTakeProfit();
+  string setup  = OrderComment();
+
+  // Trailing logic after TP1 for ZZL or when UseTrailingATR is enabled
+  if(UseTrailingATR){
+     double atr = ATR(1);
+     double trail = ATR_TrailMultiplier * atr;
+     if(type==OP_BUY){
+        double newSL = Bid - trail;
+        // For Momentum: SL+ after second momentum candle closes (approx via compare bars)
+        if(setup=="MOMENTUM_CAK"){
+           if(IsBullCSA(2)) newSL = MathMax(newSL, open); // BEP at least
+        }
+        if(newSL>sl && newSL<Bid) OrderModify(OrderTicket(),open,newSL,tp,0,clrYellow);
+     } else if(type==OP_SELL){
+        double newSL = Ask + trail;
+        if(setup=="MOMENTUM_CAK"){
+           if(IsBearCSA(2)) newSL = MathMin(newSL, open);
+        }
+        if((sl==0 || newSL<sl) && newSL>Ask) OrderModify(OrderTicket(),open,newSL,tp,0,clrYellow);
+     }
+  }
+
+  // Cutloss dinamis: Reentry & ZZL → close jika candle lawan close tembus MidBB
+  double up,mid,low; GetBB(1,up,mid,low);
+  double c1 = iClose(_Symbol,WorkTF,1);
+  if(setup=="REENTRY"||setup=="ZZL"){
+     if(type==OP_BUY && c1<mid){
+        OrderClose(OrderTicket(),lots,Bid,3,clrRed);
+     }
+     if(type==OP_SELL && c1>mid){
+        OrderClose(OrderTicket(),lots,Ask,3,clrRed);
+     }
+  }
+
+  // Time-based exit
+  if(UseTimeBasedExit){
+     if((TimeCurrent() - OrderOpenTime())/PeriodSeconds(WorkTF) >= MaxBarsHold){
+        OrderClose(OrderTicket(),lots,(type==OP_BUY?Bid:Ask),3,clrOrange);
+     }
+  }
+
+  // News SL+ if in profit
+  if(UseNewsFilter && IsWithinNewsWindow()){
+     double profitPips = (type==OP_BUY? (Bid-open) : (open-Ask))/_Point;
+     if(profitPips>0){
+        // move to BEP
+        if(type==OP_BUY && (sl<open)) OrderModify(OrderTicket(),open,open,tp,0,clrMediumBlue);
+        if(type==OP_SELL && (sl>open)) OrderModify(OrderTicket(),open,open,tp,0,clrMediumBlue);
+     }
+  }
+
+} }
+
+void UpdateStatsOnClose(){ // scan history last closed deal to update consecLoss datetime since = TimeCurrent() - 86400*3; for(int i=OrdersHistoryTotal()-1;i>=0;i--){ if(!OrderSelect(i,SELECT_BY_POS,MODE_HISTORY)) continue; if(OrderSymbol()!=_Symbol || OrderMagicNumber()!=Magic) continue; if(OrderCloseTime()<since) break; static datetime lastChecked=0; if(OrderCloseTime()<=lastChecked) continue; lastChecked=OrderCloseTime(); if(OrderProfit()<0) consecLoss++; else consecLoss=0; } }
+
+// ===================== PANEL (lightweight) ===================== void DrawPanel(){ string tag = "EAInfo"; string txt; txt = StringFormat( "EA BBMA Single TF – Smart Adaptive\n" "Mode: %s   TF: %s\n" "Bal: %.2f  Eq: %.2f  FM: %.2f\n" "Daily Loss %%: %.2f / Max %.2f   ConsecLoss: %d/%d\n" "NewsFilter: %s  ATR: %s  ZZL Risk x%.1f\n" ,(Mode==SAFE?"SAFE":Mode==HYBRID?"HYBRID":"AGGRESSIVE") ,EnumToString(WorkTF) ,AccountInfoDouble(ACCOUNT_BALANCE),AccountInfoDouble(ACCOUNT_EQUITY),AccountInfoDouble(ACCOUNT_FREEMARGIN) ,100.0*(dayStartEquity-AccountInfoDouble(ACCOUNT_EQUITY))/MathMax(1e-6,dayStartEquity) ,MaxDailyLossPct ,consecLoss,MaxConsecutiveLoss ,UseNewsFilter?"ON":"OFF" ,UseATRFilter?"ON":"OFF" ,ZZLRiskMultiplier ); Comment(txt); }
+
+// ===================== STANDARD HANDLERS ===================== int OnInit(){ ResetDailyEquityIfNeeded(); return(INIT_SUCCEEDED); }
+
+int OnDeinit(){ Comment(""); return(0); }
+
+int OnTick(){ ResetDailyEquityIfNeeded(); UpdateStatsOnClose(); DrawPanel();
+
+if(!EnableEA) return 0; if(DailyLossHit()) return 0;
+
+if(IsNewBar()){ // Close all before news open? We only stop new entries; existing positions managed in ManageOpenPositions Signal s = BuildSignal(); TryOpen(s); }
+
+ManageOpenPositions(); return 0; }
+
+//+------------------------------------------------------------------+ //  NOTE: //  - NewsTimesCSV: masukkan jadwal news high-impact manual, contoh: //    "2025.09.07 20:30;2025.09.09 02:00" (server time). EA akan pause X menit sebelum & sesudah. //  - ZZL risk multiplier default 2.0 (bisa 3.0 sesuai selera risiko). //  - TP1 Reentry = swing high/low sebelum pullback; Momentum = RR 1:2; MHV = MidBB/EMA50; //    ZZL = swing H/L sebelum pullback kedua, lalu trailing ATR. //  - Cutloss dinamis: Reentry/ZZL close jika candle lawan close tembus MidBB. //  - SL+: Momentum geser ke BEP setelah candle momentum ke-2 close. //  - This is a beta reference implementation: silakan backtest/forward test dan sesuaikan parameter pair/TF. //+------------------------------------------------------------------+
+
