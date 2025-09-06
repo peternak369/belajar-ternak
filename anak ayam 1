@@ -1,0 +1,177 @@
+//+------------------------------------------------------------------+
+//|            EA Anak Ayam 1 MT4 Full with Panel + BE + Partial     |
+//+------------------------------------------------------------------+
+#property strict
+
+// ========================================
+// Input Parameters
+// ========================================
+extern int MagicNumber = 202412;
+extern double Risk_Per_Trade = 1.0;
+extern int Slippage = 3;
+
+// ===== Risk Management Enhancements =====
+extern bool Enable_BreakEven = true;
+extern double BreakEvenTrigger = 30;    // profit (pips) untuk aktif BE
+extern double BreakEvenOffset  = 2;     // offset pips di atas entry
+
+extern bool Enable_PartialClose = true;
+extern double PartialCloseTrigger = 50; // profit (pips) untuk aktif partial
+extern double PartialClosePercent = 50; // % lot yang ditutup
+
+// ========================================
+// Global Variables
+// ========================================
+bool trading_paused = false;
+
+// ========================================
+// Initialization
+// ========================================
+int init(){
+   CreatePanel();
+   return(INIT_SUCCEEDED);
+}
+
+int deinit(){
+   ObjectsDeleteAll(0, "EA_");
+   return(0);
+}
+
+int start(){
+   UpdatePanel();
+   if(trading_paused) return(0);
+
+   // --- Trading logic placeholder ---
+   if(CheckTradeSignal()){
+      if(RiskCheckOK()){
+         ExecuteTrade();
+      }
+   }
+
+   // Manajemen posisi aktif (BE + Partial Close)
+   for(int i=OrdersTotal()-1; i>=0; i--){
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES)){
+         if(OrderMagicNumber() == MagicNumber){
+            CheckBreakEven(OrderTicket());
+            CheckPartialClose(OrderTicket());
+         }
+      }
+   }
+   return(0);
+}
+
+// ========================================
+// Chart Event Simulation (MT4 tidak ada OnChartEvent)
+// ========================================
+// Gunakan tombol panel klik manual via OBJ_BUTTON
+
+// ========================================
+// Panel UI Functions
+// ========================================
+void CreatePanel(){
+   ObjectCreate("EA_PANEL_BG", OBJ_LABEL, 0, 0, 0);
+   ObjectSet("EA_PANEL_BG", OBJPROP_XDISTANCE, 10);
+   ObjectSet("EA_PANEL_BG", OBJPROP_YDISTANCE, 20);
+   ObjectSetText("EA_PANEL_BG", "EA Anak Ayam 1 Panel", 10, "Arial", White);
+}
+
+void UpdatePanel(){
+   string info;
+   double balance = AccountBalance();
+   double equity = AccountEquity();
+   double profit = AccountProfit();
+   int openTrades = OrdersTotal();
+
+   info = StringFormat("Balance: %.2f\nEquity: %.2f\nFloating: %.2f\nOpen Trades: %d\nMode: %s\nStatus: %s",
+                       balance, equity, profit, openTrades,
+                       CurrentMode(),
+                       trading_paused ? "PAUSED" : "RUNNING");
+   ObjectSetText("EA_PANEL_BG", info, 9, "Arial", White);
+}
+
+// ========================================
+// Trading Core Logic (placeholder)
+// ========================================
+bool CheckTradeSignal(){
+   return false; // TODO: masukkan logika indikator BB, WMA, dll.
+}
+
+bool RiskCheckOK(){
+   return true;
+}
+
+void ExecuteTrade(){
+   // TODO: masukkan order execution sesuai signal
+}
+
+void CloseAllTrades(){
+   for(int i=OrdersTotal()-1; i>=0; i--){
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES)){
+         if(OrderMagicNumber() == MagicNumber){
+            if(OrderType() == OP_BUY)
+               OrderClose(OrderTicket(), OrderLots(), Bid, Slippage, clrRed);
+            if(OrderType() == OP_SELL)
+               OrderClose(OrderTicket(), OrderLots(), Ask, Slippage, clrRed);
+         }
+      }
+   }
+}
+
+string CurrentMode(){
+   return "AYAM LINCAH";
+}
+
+// ========================================
+// Break-even & Partial Close Functions
+// ========================================
+void CheckBreakEven(int ticket){
+   if(!Enable_BreakEven) return;
+   if(OrderSelect(ticket, SELECT_BY_TICKET, MODE_TRADES)){
+      if(OrderType() == OP_BUY){
+         double profitPips = (Bid - OrderOpenPrice())/Point;
+         if(profitPips >= BreakEvenTrigger){
+            double newSL = OrderOpenPrice() + (BreakEvenOffset*Point);
+            if(OrderStopLoss() < newSL){
+               OrderModify(OrderTicket(), OrderOpenPrice(), newSL, OrderTakeProfit(), 0, clrGreen);
+            }
+         }
+      }
+      if(OrderType() == OP_SELL){
+         double profitPips = (OrderOpenPrice() - Ask)/Point;
+         if(profitPips >= BreakEvenTrigger){
+            double newSL = OrderOpenPrice() - (BreakEvenOffset*Point);
+            if(OrderStopLoss() > newSL || OrderStopLoss() == 0){
+               OrderModify(OrderTicket(), OrderOpenPrice(), newSL, OrderTakeProfit(), 0, clrRed);
+            }
+         }
+      }
+   }
+}
+
+void CheckPartialClose(int ticket){
+   if(!Enable_PartialClose) return;
+   if(OrderSelect(ticket, SELECT_BY_TICKET, MODE_TRADES)){
+      double lot = OrderLots();
+      double lotToClose = lot * PartialClosePercent / 100.0;
+      if(lotToClose < MarketInfo(OrderSymbol(), MODE_MINLOT)) return;
+
+      if(OrderType() == OP_BUY){
+         double profitPips = (Bid - OrderOpenPrice())/Point;
+         if(profitPips >= PartialCloseTrigger){
+            if(OrderClose(OrderTicket(), lotToClose, Bid, Slippage, clrYellow)){
+               Print("Partial close executed: ", lotToClose, " lots");
+            }
+         }
+      }
+      if(OrderType() == OP_SELL){
+         double profitPips = (OrderOpenPrice() - Ask)/Point;
+         if(profitPips >= PartialCloseTrigger){
+            if(OrderClose(OrderTicket(), lotToClose, Ask, Slippage, clrYellow)){
+               Print("Partial close executed: ", lotToClose, " lots");
+            }
+         }
+      }
+   }
+}
+//+------------------------------------------------------------------+
+
