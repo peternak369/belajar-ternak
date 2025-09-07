@@ -1,0 +1,437 @@
+//+------------------------------------------------------------------+
+//|                                              EA_Candle_Pattern   |
+//|                        Price-Action: MC, IB, UCRP, Engulfing     |
+//|                        Risk 3% | SL 20–30 | Fixed Buffer | BE    |
+//+------------------------------------------------------------------+
+#property strict
+
+//--------------------- Inputs ---------------------//
+input int    MagicNumber             = 240915;    // unik per chart
+input double RiskPercent             = 3.0;       // 3% fix
+input int    SL_Pips_Default         = 20;        // mayor: 20 | volatile: 30
+input int    SL_Pips_Alt             = 30;        // opsi volatil (ubah manual)
+input int    BreakoutBufferPips      = 5;         // mayor: 5 | volatile: 10
+input bool   UseTP_Ratio             = true;      // default pakai RR
+input double RR_Ratio                = 2.0;       // TP = SL * RR
+input int    TP_Fixed_Pips           = 40;        // jika UseTP_Ratio=false
+input bool   UseTP_MCSize            = false;     // TP = size Mother Candle
+
+input bool   UseSessionFilter        = true;
+input int    SessionStartHour        = 6;         // 06:00
+input int    SessionStartMinute      = 0;
+input int    SessionEndHour          = 23;        // 23:00
+input int    SessionEndMinute        = 0;
+
+input bool   UsePartialClose         = false;
+input int    PartialClosePercent     = 50;        // 50%
+input double PartialCloseAtRR        = 1.0;       // tutup sebagian di RR=1.0
+
+input bool   UseTrailing             = false;
+input double TrailStartRR            = 1.5;       // mulai trailing setelah RR>=1.5
+input int    TrailStepPips           = 10;
+
+input int    Slippage                = 3;
+
+//--------------------- Timeframes -----------------//
+#define TF_M15 PERIOD_M15
+#define TF_H1  PERIOD_H1
+
+//--------------------- Pattern Types --------------//
+enum PatternType { PT_NONE=0, PT_MC=1, PT_IB=2, PT_UCRP=3, PT_ENGULF=4 };
+
+struct PatternZone {
+   datetime time; // waktu candle acuan
+   int      tf;
+   double   hi;
+   double   lo;
+   PatternType type;
+   double   aux; // mis: size MC (pips)
+   bool     bullish; // utk reversal (UCRP/Engulf)
+};
+
+//--------------------- Globals --------------------//
+datetime lastBar_M15 = 0;
+datetime lastBar_H1  = 0;
+
+//--------------------- Utilities ------------------//
+double PipSize(){
+   // pips untuk FX mayor: 0.0001, JPY 0.01. 5-digit => Point*10
+   if(Digits==3 || Digits==5) return Point*10;
+   return Point;
+}
+double PipsToPrice(double pips){ return pips*PipSize(); }
+
+// Per pip value per 1 lot (approx robust)
+double PipValuePerLot(){
+   double tickval = MarketInfo(Symbol(), MODE_TICKVALUE);
+   double ticksz  = MarketInfo(Symbol(), MODE_TICKSIZE);
+   if(ticksz<=0) ticksz = Point;
+   double perPointVal = tickval / ticksz;      // value per 1.0 price point
+   return perPointVal * PipSize();             // value per 1 pip
+}
+
+// Hitung lot berdasar risk% & SL pips
+double CalcLotByRisk(double sl_pips){
+   if(sl_pips<=0) sl_pips = SL_Pips_Default;
+   double riskMoney = AccountEquity() * (RiskPercent/100.0);
+   double perPipLot = PipValuePerLot();                   // $/pip @ 1 lot
+   if(perPipLot<=0.0) perPipLot = 1.0;                    // fallback
+   double lots = riskMoney / (sl_pips * perPipLot);
+   // normalisasi ke step
+   double minLot  = MarketInfo(Symbol(), MODE_MINLOT);
+   double maxLot  = MarketInfo(Symbol(), MODE_MAXLOT);
+   double lotStep = MarketInfo(Symbol(), MODE_LOTSTEP);
+   if(lotStep<=0) lotStep=0.01;
+   lots = MathFloor(lots/lotStep)*lotStep;
+   if(lots<minLot) lots=minLot;
+   if(lots>maxLot) lots=maxLot;
+   return NormalizeDouble(lots,2);
+}
+
+// Jam trading (server time)
+bool InSession(datetime t){
+   if(!UseSessionFilter) return true;
+   // ambil jam:menit dari server time
+   int H = TimeHour(t);
+   int M = TimeMinute(t);
+   int curMin = H*60+M;
+   int start  = SessionStartHour*60 + SessionStartMinute;
+   int endt   = SessionEndHour*60   + SessionEndMinute;
+   if(start<=endt) return (curMin>=start && curMin<=endt);
+   // jika sesi melewati midnight
+   return (curMin>=start || curMin<=endt);
+}
+
+// Deteksi bar baru untuk TF tertentu
+bool IsNewBar(int tf, datetime &lastStamp){
+   datetime t0 = iTime(Symbol(), tf, 0);
+   if(t0!=lastStamp){
+      lastStamp = t0;
+      return true;
+   }
+   return false;
+}
+
+//--------------------- Pattern Detection -----------//
+// Mother Candle (H1) -> gunakan bar index 1 (closed)
+bool DetectMotherCandle(PatternZone &outZone){
+   int tf = TF_H1;
+   int i1=1;
+   double hi = iHigh(Symbol(), tf, i1);
+   double lo = iLow (Symbol(), tf, i1);
+   if(hi==0 || lo==0) return false;
+
+   double range_pips = (hi - lo)/PipSize();
+   // Range MC wajar; biarkan fleksibel tapi >body minimal
+   if(range_pips < 30) return false; // batas bawah wajar agar tidak terlalu kecil
+
+   outZone.time = iTime(Symbol(), tf, i1);
+   outZone.tf   = tf;
+   outZone.hi   = hi;
+   outZone.lo   = lo;
+   outZone.type = PT_MC;
+   outZone.aux  = range_pips; // simpan size MC (pips)
+   outZone.bullish=false;
+   return true;
+}
+
+// Inside Bar (tf bisa M15/H1) -> bar[1] fully inside bar[2]
+bool DetectInsideBar(int tf, PatternZone &outZone){
+   int i1=1, i2=2;
+   double h1=iHigh(Symbol(), tf, i1), l1=iLow(Symbol(), tf, i1);
+   double h2=iHigh(Symbol(), tf, i2), l2=iLow(Symbol(), tf, i2);
+   if(h1==0||l1==0||h2==0||l2==0) return false;
+
+   if(h1 < h2 && l1 > l2){
+      outZone.time = iTime(Symbol(), tf, i1);
+      outZone.tf   = tf;
+      outZone.hi   = h1;
+      outZone.lo   = l1;
+      outZone.type = PT_IB;
+      outZone.aux  = (h1-l1)/PipSize();
+      outZone.bullish=false;
+      return true;
+   }
+   return false;
+}
+
+// UCRP (H1): dua candle berlawanan, Open[1] ~ Close[2] (toleransi 2 pips)
+bool DetectUCRP(PatternZone &outZone){
+   int tf = TF_H1;
+   int i1=1, i2=2;
+   double o1=iOpen(Symbol(), tf, i1), c1=iClose(Symbol(), tf, i1);
+   double o2=iOpen(Symbol(), tf, i2), c2=iClose(Symbol(), tf, i2);
+   if(o1==0||c1==0||o2==0||c2==0) return false;
+
+   bool bull1 = (c1>o1);
+   bool bull2 = (c2>o2);
+   if(bull1==bull2) return false; // harus berlawanan
+
+   double tol = PipsToPrice(2);
+   if(MathAbs(o1 - c2) > tol) return false;
+
+   outZone.time = iTime(Symbol(), tf, i1);
+   outZone.tf   = tf;
+   // zona ambil high/low dari dua candle
+   double hi = MathMax(iHigh(Symbol(),tf,i1), iHigh(Symbol(),tf,i2));
+   double lo = MathMin(iLow (Symbol(),tf,i1), iLow (Symbol(),tf,i2));
+   outZone.hi = hi; outZone.lo = lo;
+   outZone.type = PT_UCRP;
+   outZone.aux  = (hi-lo)/PipSize();
+   outZone.bullish = bull1; // arah candle[1]
+   return true;
+}
+
+// Engulfing body (tf M15/H1): body candle[1] menutupi body candle[2]
+bool DetectEngulfing(int tf, PatternZone &outZone){
+   int i1=1, i2=2;
+   double o1=iOpen(Symbol(), tf, i1), c1=iClose(Symbol(), tf, i1);
+   double o2=iOpen(Symbol(), tf, i2), c2=iClose(Symbol(), tf, i2);
+   if(o1==0||c1==0||o2==0||c2==0) return false;
+
+   bool bull1 = (c1>o1);
+   bool bull2 = (c2>o2);
+   if(bull1 && !bull2 && (o1<=c2) && (c1>=o2)){
+      // Bullish engulf
+      outZone.time=iTime(Symbol(), tf, i1);
+      outZone.tf=tf; outZone.type=PT_ENGULF; outZone.bullish=true;
+   } else
+   if(!bull1 && bull2 && (o1>=c2) && (c1<=o2)){
+      // Bearish engulf
+      outZone.time=iTime(Symbol(), tf, i1);
+      outZone.tf=tf; outZone.type=PT_ENGULF; outZone.bullish=false;
+   } else return false;
+
+   double hi = MathMax(iHigh(Symbol(),tf,i1), iHigh(Symbol(),tf,i2));
+   double lo = MathMin(iLow (Symbol(),tf,i1), iLow (Symbol(),tf,i2));
+   outZone.hi=hi; outZone.lo=lo;
+   outZone.aux=(hi-lo)/PipSize();
+   return true;
+}
+
+//--------------------- Signal Validation -----------//
+bool ValidateBreakout(const PatternZone &z, bool &buy, bool &sell){
+   buy=false; sell=false;
+   double buf = PipsToPrice(BreakoutBufferPips);
+   // gunakan close bar[1] untuk validasi
+   double cls = iClose(Symbol(), z.tf, 1);
+   if(cls==0) return false;
+   if(cls > z.hi + buf) buy = true;
+   if(cls < z.lo - buf) sell= true;
+   return (buy||sell);
+}
+
+//--------------------- TP Builder ------------------//
+double BuildTP(double entry, double sl, bool isBuy, const PatternZone &z){
+   if(UseTP_MCSize && z.type==PT_MC){
+      double tpDist = PipsToPrice(z.aux); // size MC dalam pips -> price
+      return isBuy ? (entry + tpDist) : (entry - tpDist);
+   }
+   if(UseTP_Ratio){
+      double dist = MathAbs(entry - sl); // price distance
+      double tpDist = dist * RR_Ratio;
+      return isBuy ? (entry + tpDist) : (entry - tpDist);
+   }
+   // Fixed pips
+   double fp = PipsToPrice(TP_Fixed_Pips);
+   return isBuy ? (entry + fp) : (entry - fp);
+}
+
+//--------------------- Order Placement -------------//
+void PlaceBreakoutTrade(const PatternZone &z){
+   bool doBuy=false, doSell=false;
+   if(!ValidateBreakout(z, doBuy, doSell)) return;
+
+   // pilih SL pips sesuai default (user bisa ubah manual via input alt)
+   int slPips = SL_Pips_Default;
+
+   double lot = CalcLotByRisk(slPips);
+   double ask=NormalizeDouble(Ask, Digits);
+   double bid=NormalizeDouble(Bid, Digits);
+   double buf= PipsToPrice(BreakoutBufferPips);
+   double sl, tp; int ticket;
+
+   if(doBuy){
+      // SL minimal di sisi lawan zona atau SL default (ambil yg lebih jauh = konservatif)
+      double slA = z.lo - buf;
+      double slB = ask - PipsToPrice(slPips);
+      sl = MathMin(slA, slB);
+      tp = BuildTP(ask, sl, true, z);
+      ticket = OrderSend(Symbol(), OP_BUY, lot, ask, Slippage, NormalizeDouble(sl,Digits), NormalizeDouble(tp,Digits),
+                         "EA Candle Pattern", MagicNumber, 0, clrBlue);
+      if(ticket<0) Print("Buy failed: ", GetLastError());
+   }
+   if(doSell){
+      double slA = z.hi + buf;
+      double slB = bid + PipsToPrice(slPips);
+      sl = MathMax(slA, slB);
+      tp = BuildTP(bid, sl, false, z);
+      ticket = OrderSend(Symbol(), OP_SELL, lot, bid, Slippage, NormalizeDouble(sl,Digits), NormalizeDouble(tp,Digits),
+                         "EA Candle Pattern", MagicNumber, 0, clrRed);
+      if(ticket<0) Print("Sell failed: ", GetLastError());
+   }
+}
+
+// Reversal: langsung entry arah pola (UCRP/Engulfing)
+void PlaceReversalTrade(const PatternZone &z){
+   int slPips = SL_Pips_Default;
+   double lot = CalcLotByRisk(slPips);
+   double ask=NormalizeDouble(Ask, Digits);
+   double bid=NormalizeDouble(Bid, Digits);
+   double buf= PipsToPrice(BreakoutBufferPips);
+   double sl, tp; int ticket;
+
+   if(z.bullish){
+      double slA = z.lo - buf;
+      double slB = ask - PipsToPrice(slPips);
+      sl = MathMin(slA, slB);
+      tp = BuildTP(ask, sl, true, z);
+      ticket = OrderSend(Symbol(), OP_BUY, lot, ask, Slippage, NormalizeDouble(sl,Digits), NormalizeDouble(tp,Digits),
+                         "EA Candle Pattern", MagicNumber, 0, clrBlue);
+      if(ticket<0) Print("Buy failed (rev): ", GetLastError());
+   }else{
+      double slA = z.hi + buf;
+      double slB = bid + PipsToPrice(slPips);
+      sl = MathMax(slA, slB);
+      tp = BuildTP(bid, sl, false, z);
+      ticket = OrderSend(Symbol(), OP_SELL, lot, bid, Slippage, NormalizeDouble(sl,Digits), NormalizeDouble(tp,Digits),
+                         "EA Candle Pattern", MagicNumber, 0, clrRed);
+      if(ticket<0) Print("Sell failed (rev): ", GetLastError());
+   }
+}
+
+//--------------------- Trade Management -------------//
+void ManageBreakEven(){
+   // BE saat profit >= SL distance → SL ke BE +1 pip (BUY) / BE -1 pip (SELL)
+   double onePip = PipsToPrice(1);
+   for(int i=OrdersTotal()-1; i>=0; i--){
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MagicNumber) continue;
+
+      int type = OrderType();
+      if(type!=OP_BUY && type!=OP_SELL) continue;
+
+      double open = OrderOpenPrice();
+      double sl   = OrderStopLoss();
+      double cur  = (type==OP_BUY) ? Bid : Ask;
+      double slDist = MathAbs(open - sl);
+      if(slDist<=0) continue;
+
+      double runProfitDist = (type==OP_BUY) ? (cur - open) : (open - cur);
+      if(runProfitDist >= slDist){
+         double newSL = (type==OP_BUY) ? (open + onePip) : (open - onePip);
+         // hanya update jika lebih protektif
+         if( (type==OP_BUY  && (sl < newSL)) ||
+             (type==OP_SELL && (sl > newSL)) ){
+            bool ok = OrderModify(OrderTicket(), OrderOpenPrice(),
+                                  NormalizeDouble(newSL,Digits),
+                                  OrderTakeProfit(), OrderExpiration(),
+                                  clrYellow);
+            if(!ok) Print("BE modify failed: ", GetLastError());
+         }
+      }
+   }
+}
+
+void ManagePartialClose(){
+   if(!UsePartialClose) return;
+   double part = MathMin(MathMax(PartialClosePercent,1),99)/100.0;
+   for(int i=OrdersTotal()-1;i>=0;i--){
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MagicNumber) continue;
+      if(OrderType()!=OP_BUY && OrderType()!=OP_SELL) continue;
+
+      double open = OrderOpenPrice();
+      double sl   = OrderStopLoss();
+      double cur  = (OrderType()==OP_BUY) ? Bid : Ask;
+      double slDist = MathAbs(open - sl);
+      if(slDist<=0) continue;
+      double run = (OrderType()==OP_BUY) ? (cur - open) : (open - cur);
+      double rr  = run / slDist;
+      if(rr >= PartialCloseAtRR){
+         double lotNow = OrderLots();
+         double lotClose = NormalizeDouble(lotNow*part,2);
+         if(lotClose >= MarketInfo(Symbol(), MODE_MINLOT) && lotClose < lotNow){
+            bool ok = OrderClose(OrderTicket(), lotClose, cur, Slippage, clrAqua);
+            if(!ok) Print("Partial close failed: ", GetLastError());
+         }
+      }
+   }
+}
+
+void ManageTrailing(){
+   if(!UseTrailing) return;
+   double step = PipsToPrice(TrailStepPips);
+   for(int i=OrdersTotal()-1;i>=0;i--){
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+      if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MagicNumber) continue;
+      if(OrderType()!=OP_BUY && OrderType()!=OP_SELL) continue;
+
+      double open = OrderOpenPrice();
+      double sl   = OrderStopLoss();
+      double cur  = (OrderType()==OP_BUY) ? Bid : Ask;
+      double slDist = MathAbs(open - sl);
+      if(slDist<=0) continue;
+      // trailing aktif setelah RR >= TrailStartRR
+      double run  = (OrderType()==OP_BUY) ? (cur - open) : (open - cur);
+      if(run < slDist * TrailStartRR) continue;
+
+      double newSL;
+      if(OrderType()==OP_BUY){
+         newSL = cur - step;
+         if(newSL > sl){
+            OrderModify(OrderTicket(), open, NormalizeDouble(newSL,Digits),
+                        OrderTakeProfit(), OrderExpiration(), clrGreen);
+         }
+      }else{
+         newSL = cur + step;
+         if(newSL < sl){
+            OrderModify(OrderTicket(), open, NormalizeDouble(newSL,Digits),
+                        OrderTakeProfit(), OrderExpiration(), clrGreen);
+         }
+      }
+   }
+}
+
+//--------------------- Scanners --------------------//
+void ScanAndTrade_H1(){
+   // Mother Candle breakout
+   PatternZone z;
+   if(DetectMotherCandle(z)) PlaceBreakoutTrade(z);
+
+   // UCRP reversal
+   PatternZone zr;
+   if(DetectUCRP(zr)) PlaceReversalTrade(zr);
+}
+void ScanAndTrade_M15(){
+   // Inside Bar breakout
+   PatternZone zib;
+   if(DetectInsideBar(TF_M15, zib)) PlaceBreakoutTrade(zib);
+
+   // Engulfing reversal
+   PatternZone zen;
+   if(DetectEngulfing(TF_M15, zen)) PlaceReversalTrade(zen);
+}
+
+//--------------------- EA Lifecycle ----------------//
+int OnInit(){
+   Print("EA Candle Pattern initialized. Symbol=", Symbol(), " Digits=",Digits);
+   lastBar_M15 = iTime(Symbol(), TF_M15, 0);
+   lastBar_H1  = iTime(Symbol(), TF_H1 , 0);
+   return(INIT_SUCCEEDED);
+}
+int OnDeinit(){ return(0); }
+
+void OnTick(){
+   if(!InSession(TimeCurrent())) return;
+
+   // Proses saat bar baru agar satu sinyal sekali eksekusi
+   if(IsNewBar(TF_M15, lastBar_M15)) ScanAndTrade_M15();
+   if(IsNewBar(TF_H1 , lastBar_H1 )) ScanAndTrade_H1();
+
+   // Kelola posisi setiap tick
+   ManageBreakEven();
+   ManagePartialClose();
+   ManageTrailing();
+}
+//+------------------------------------------------------------------+
