@@ -1,0 +1,159 @@
+//+------------------------------------------------------------------+ //|                                                 EA_Aksel_BBMA.mq4| //|                         BBMA Single-TF (M5 basis) – "AKSEL"      | //|  Konsep: Single TF (M5). M15 & H1 diaproksimasi via period scale | //|  Setup: Reentry, Momentum (CAK->Reentry), ZZL, (opsional MHV)    | //|  TP: TP1 + Partial Close + Trailing ATR Dinamis                  | //|  Mode: SAFE / HYBRID / AGGRESSIVE / SUPER_AGGRESSIVE             | //|  Catatan: Kode ringkas & modular. Parameter default anti-overfit | //+------------------------------------------------------------------+ #property strict #property version   "0.9.3" #property description "EA AKSEL – BBMA Single-TF (M5 basis)" #property description "M15 & H1 proxy di M5 (BB60/240, EMA150/600, dst)" #property description "Setup: Reentry, Momentum (CAK->Reentry), ZZL" #property description "TP: TP1 + Partial + Trailing ATR"
+
+//===================================================== //====================  INPUTS  ======================= //===================================================== input int      Magic              = 905601;     // Magic number input double   RiskPerTradePct    = 1.0;        // Risiko per posisi (% equity) input double   ZZLRiskMultiplier  = 2.0;        // Pengali risiko khusus ZZL (2-3) input double   LotsMin            = 0.01;       // Lot minimum input double   LotsMax            = 10.0;       // Lot maksimum
+
+// ATR & Trailing input int      ATR_Period_M5      = 14;         // ATR dasar (M5) input double   ATR_CSA_Factor     = 0.7;        // Body >= ATR*factor untuk valid CSA proxy input double   ATR_TrailMult_Re   = 1.5;        // Trailing multiplier Reentry input double   ATR_TrailMult_Mom  = 1.8;        // Trailing multiplier Momentum input double   ATR_TrailMult_ZZL  = 2.0;        // Trailing multiplier ZZL
+
+// Partial close input double   PartialClosePct_Re = 40;         // % lot ditutup di TP1 (Reentry) input double   PartialClosePct_Mo = 50;         // % lot ditutup di TP1 (Momentum) input double   PartialClosePct_ZZ = 30;         // % lot ditutup di TP1 (ZZL)
+
+// Mode trading: 0=SAFE, 1=HYBRID, 2=AGGRESSIVE, 3=SUPER_AGGRESSIVE input int      Mode               = 1; input bool     Use_MHV_SuperAgg   = true;       // Hanya aktif efektif di mode 3
+
+// Proteksi input double   MaxDailyLossPct    = 5.0;        // Stop trading jika loss harian >= nilai ini input int      MaxConsecutiveLoss = 3;          // Henti sementara bila hit loss berturut-turut input int      MaxBarsHold        = 0;          // 0=disable, >0 paksa tutup setelah N bar
+
+// News filter (manual CSV jadwal broker time) input bool     UseNewsFilter      = true; input string   NewsTimesCSV       = "";         // Format: YYYY.MM.DD HH:MM;YYYY.MM.DD HH:MM;... input int      MinutesBeforeNews  = 30;         // Pause X menit sebelum input int      MinutesAfterNews   = 30;         // Pause X menit sesudah input bool     ForceSLPlusOnNews  = true;       // Jika posisi floating profit -> pasang SL+
+
+// Visual input bool     ShowPanel          = true;       // Tampilkan ringkas status via Comment()
+
+//===================================================== //=================  GLOBAL STATE  ==================== //===================================================== enum SetupType { ST_NONE=0, ST_REENTRY=1, ST_MOMENTUM=2, ST_ZZL=3, ST_MHV=4 };
+
+datetime  dayStamp=0;            // cap tanggal harian double    dayStartEquity=0;       // equity awal hari int       consecLoss=0;           // hitungan loss beruntun
+
+//===================================================== //=================  UTIL FUNCTIONS  ================== //===================================================== double Clamp(double v,double lo,double hi){ if(v<lo) return lo; if(v>hi) return hi; return v; } int    Dig(){ return (int)MarketInfo(Symbol(),MODE_DIGITS); } double Pip(){ return (Dig()==3 || Dig()==5)? 0.01 : 0.0001; }
+
+double GetATR(int period){ return iATR(Symbol(), PERIOD_M5, period, 0); }
+
+double LotsByRisk(double stopDistancePoints, double riskPct){ if(stopDistancePoints<=0) return LotsMin; double equity = AccountEquity(); double riskMoney = equity * (riskPct/100.0); double tickval   = MarketInfo(Symbol(), MODE_TICKVALUE); double ticksize  = MarketInfo(Symbol(), MODE_TICKSIZE); if(ticksize<=0) ticksize = Pip(); double lot = riskMoney / ((stopDistancePoints*tickval)/ticksize); lot = NormalizeDouble(lot,2); return Clamp(lot, LotsMin, LotsMax); }
+
+bool IsBuy(int type){ return (type==OP_BUY); } bool IsSell(int type){ return (type==OP_SELL); }
+
+bool TradingPausedByNews(){ if(!UseNewsFilter || StringLen(NewsTimesCSV)==0) return false; datetime now = TimeCurrent(); int pos=0; while(true){ string when = StringTrim(StringSubstr(NewsTimesCSV,pos,StringFind(NewsTimesCSV+";", ";", pos)-pos)); int nextSep = StringFind(NewsTimesCSV, ";", pos); if(nextSep<0){ when = StringTrim(StringSubstr(NewsTimesCSV,pos)); } if(StringLen(when)>0){ datetime t = StrToTime(when); if(t>0){ datetime from = t - MinutesBeforeNews60; datetime to   = t + MinutesAfterNews60; if(now>=from && now<=to) return true; } } if(nextSep<0) break; else pos = nextSep+1; } return false; }
+
+//===================================================== //=============  BB & MA PROXY (M5 BASIS)  ============ //===================================================== // H1 proxy: factor 12  => BB240, EMA600, EMA2400 // M15 proxy: factor 3  => BB60, EMA150
+
+double BB_M5_MAIN(int period, int shift){ return iBands(Symbol(), PERIOD_M5, period, 0, 2.0, PRICE_CLOSE, MODE_MAIN,  shift); } double BB_M5_UP(int period, int shift){   return iBands(Symbol(), PERIOD_M5, period, 0, 2.0, PRICE_CLOSE, MODE_UPPER, shift); } double BB_M5_LOW(int period, int shift){  return iBands(Symbol(), PERIOD_M5, period, 0,  2.0, PRICE_CLOSE, MODE_LOWER, shift); }
+
+double EMA_M5(int per,int shift){ return iMA(Symbol(), PERIOD_M5, per, 0, MODE_EMA, PRICE_CLOSE, shift); } double SMA_M5(int per,int shift){ return iMA(Symbol(), PERIOD_M5, per, 0, MODE_SMA, PRICE_CLOSE, shift); }
+
+// Short-hands #define BB_M15 60 #define BB_H1  240 #define EMA_M15_50 150 #define EMA_H1_50  600 #define EMA_H1_200 2400 #define MA_M15_5   15 #define MA_M15_10  30 #define MA_H1_5    60 #define MA_H1_10   120
+
+//===================================================== //================  SIGNAL DETECTORS  ================= //===================================================== bool FilterTrendH1Up(){ double mid = BB_M5_MAIN(BB_H1,0); double ema = EMA_M5(EMA_H1_50,0); double close0 = Close[0]; double midPrev = BB_M5_MAIN(BB_H1,1); return (close0>mid && ema>mid && mid>midPrev); // atas & slope naik }
+
+bool FilterTrendH1Down(){ double mid = BB_M5_MAIN(BB_H1,0); double ema = EMA_M5(EMA_H1_50,0); double close0 = Close[0]; double midPrev = BB_M5_MAIN(BB_H1,1); return (close0<mid && ema<mid && mid<midPrev); // bawah & slope turun }
+
+bool IsCSAK_Strong(){ // CSA proxy di M5: body >= ATR(42)factor (≈ ATR14 M15) double body = MathAbs(Open[0]-Close[0]); double atr  = iATR(Symbol(), PERIOD_M5, 42, 0); return (body >= atrATR_CSA_Factor); }
+
+bool ReentryBuyReady(){ // Setelah ada momentum searah (CSAK kuat), lalu pullback ke MA15/30 (M15 proxy) bool trendOK = (Mode>=2? FilterTrendH1Up() : FilterTrendH1Up()); // semua mode butuh searah H1 if(!trendOK) return false; // reentry buy: harga mendekat/menyentuh MA15/30 lalu memantul double ma5 = EMA_M5(MA_M15_5,0); double ma10= EMA_M5(MA_M15_10,0); return (Low[1]<=ma5 || Low[1]<=ma10) && Close[0]>Open[0]; }
+
+bool ReentrySellReady(){ bool trendOK = (Mode>=2? FilterTrendH1Down() : FilterTrendH1Down()); if(!trendOK) return false; double ma5 = EMA_M5(MA_M15_5,0); double ma10= EMA_M5(MA_M15_10,0); return (High[1]>=ma5 || High[1]>=ma10) && Close[0]<Open[0]; }
+
+bool MomentumBuyReady(){ if(!(Mode>=1)) return false; // minimal HYBRID if(!FilterTrendH1Up()) return false; // CSA kuat bar ini, entry bukan di CSA, tapi hanya validasi → akan entry reentry berikutnya return IsCSAK_Strong() && Close[0]>Open[0]; }
+
+bool MomentumSellReady(){ if(!(Mode>=1)) return false; if(!FilterTrendH1Down()) return false; return IsCSAK_Strong() && Close[0]<Open[0]; }
+
+bool ZZLBuyReady(){ if(!(Mode>=1)) return false; if(!FilterTrendH1Up()) return false; double mid60 = BB_M5_MAIN(BB_M15,0); double ema150= EMA_M5(EMA_M15_50,0); double ma5   = EMA_M5(MA_M15_5,0); double ma10  = EMA_M5(MA_M15_10,0); return (Close[0]>mid60 && ma5>mid60 && ma10>mid60 && Close[0]>ema150); }
+
+bool ZZLSellReady(){ if(!(Mode>=1)) return false; if(!FilterTrendH1Down()) return false; double mid60 = BB_M5_MAIN(BB_M15,0); double ema150= EMA_M5(EMA_M15_50,0); double ma5   = EMA_M5(MA_M15_5,0); double ma10  = EMA_M5(MA_M15_10,0); return (Close[0]<mid60 && ma5<mid60 && ma10<mid60 && Close[0]<ema150); }
+
+//===================================================== //=================  ORDER HELPERS  =================== //===================================================== int OpenOrder(int type,double lot,double sl,double tp,string comment){ double price = (type==OP_BUY)? Ask : Bid; double slip  = 3*Pip(); int    ticket= OrderSend(Symbol(), type, lot, price,  slippage(slip), sl, tp, comment, Magic, 0, clrDodgerBlue); return ticket; }
+
+double slippage(double raw){ return (Dig()==3||Dig()==5)? raw*10.0 : raw; }
+
+void ModifySLTP(int ticket,double sl,double tp){ if(!OrderSelect(ticket, SELECT_BY_TICKET)) return; double price = OrderType()==OP_BUY? Bid:Ask; OrderModify(ticket, OrderOpenPrice(), sl, tp, 0, clrNONE); }
+
+void ClosePartial(int ticket,double percent){ if(!OrderSelect(ticket, SELECT_BY_TICKET)) return; if(percent<=0 || percent>=100) return; double vol = NormalizeDouble(OrderLots()*(percent/100.0),2); if(vol<MarketInfo(Symbol(),MODE_MINLOT)) return; int type = OrderType(); double price = type==OP_BUY? Bid:Ask; OrderClose(ticket, vol, price, 3, clrCoral); }
+
+void CloseOrder(int ticket){ if(!OrderSelect(ticket, SELECT_BY_TICKET)) return; int type=OrderType(); double price = (type==OP_BUY)? Bid:Ask; OrderClose(ticket, OrderLots(), price, 3, clrRed); }
+
+//===================================================== //=================  RISK / GUARDRAILS  =============== //===================================================== bool DailyRiskBreached(){ datetime today = DateOfDay(TimeCurrent()); if(dayStamp!=today){ dayStamp=today; dayStartEquity=AccountEquity(); consecLoss=0; } double dd = 100.0*(dayStartEquity-AccountEquity())/MathMax(1,dayStartEquity); return (dd>=MaxDailyLossPct); }
+
+datetime DateOfDay(datetime t){ MqlDateTime m; TimeToStruct(t,m); m.hour=0; m.min=0; m.sec=0; return StructToTime(m); }
+
+void UpdateWinLossCounters(){ // panggil ketika posisi tertutup double lastpl=0; datetime lastclose=0; int lastticket=-1; for(int i=OrdersHistoryTotal()-1;i>=0;i--){ if(OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)){ if(OrderMagicNumber()!=Magic || OrderSymbol()!=Symbol()) continue; if(OrderCloseTime()>lastclose){ lastclose=OrderCloseTime(); lastpl=OrderProfit()+OrderSwap()+OrderCommission(); lastticket=OrderTicket(); } } } if(lastticket!=-1){ if(lastpl<0) consecLoss++; else consecLoss=0; } }
+
+bool PauseByConsecLoss(){ return (MaxConsecutiveLoss>0 && consecLoss>=MaxConsecutiveLoss); }
+
+//===================================================== //=================  ENTRY & EXIT LOGIC  ============== //===================================================== void TryEntries(){ if(TradingPausedByNews()) return; if(DailyRiskBreached())   return; if(PauseByConsecLoss())   return;
+
+// Cek sinyal per setup bool reBuy = ReentryBuyReady(); bool reSel = ReentrySellReady(); bool moBuy = MomentumBuyReady(); bool moSel = MomentumSellReady(); bool zzBuy = ZZLBuyReady(); bool zzSel = ZZLSellReady();
+
+// Eksekusi: prioritas ZZL > Reentry > Momentum (sesuai profil) if(zzBuy) PlaceTrade(OP_BUY, ST_ZZL); else if(zzSel) PlaceTrade(OP_SELL, ST_ZZL); else if(reBuy) PlaceTrade(OP_BUY, ST_REENTRY); else if(reSel) PlaceTrade(OP_SELL, ST_REENTRY); else if(moBuy) PlaceTrade(OP_BUY, ST_MOMENTUM); else if(moSel) PlaceTrade(OP_SELL, ST_MOMENTUM); }
+
+void PlaceTrade(int dir, SetupType st){ // Hitung SL awal double sl=0,tp=0; double atr=GetATR(ATR_Period_M5); double price= (dir==OP_BUY? Ask:Bid);
+
+if(st==ST_REENTRY || st==ST_ZZL){ // SL = band luar BB lawan (M5 BB20) double band = (dir==OP_BUY)? BB_M5_LOW(20,0) : BB_M5_UP(20,0); sl = (dir==OP_BUY)? band - atr0.5 : band + atr0.5; // TP1 = struktur High/Low sebelum pullback (approx: swing prev) int swing = FindLastSwing(dir); if(swing>1){ double level = (dir==OP_BUY? High[swing]:Low[swing]); tp=level; } } else if(st==ST_MOMENTUM){ // SL = shadow candle momentum (bar sebelumnya jika CSA sekarang) double shad = (dir==OP_BUY? Low[1]:High[1]); sl = (dir==OP_BUY? shad - atr0.2 : shad + atr0.2); // TP1 = RR 1:2 double risk = MathAbs(price-sl); tp = (dir==OP_BUY? price + 2risk : price - 2risk); }
+
+// Lot double stopPts = MathAbs(price-sl)/Pip(); double riskPct = RiskPerTradePct * ((st==ST_ZZL)? ZZLRiskMultiplier:1.0); double lots    = LotsByRisk(stopPts, riskPct);
+
+// Kirim order string c = (st==ST_REENTRY?"RE": (st==ST_ZZL?"ZZL":"MO")); int tk = OpenOrder(dir, lots, sl, tp, c); }
+
+int FindLastSwing(int dir){ // Cari swing high/low sederhana (lookback 10 bar) int look=10; if(dir==OP_BUY){ for(int i=2;i<=look;i++) if( High[i]>High[i+1] && High[i]>High[i-1]) return i; }else{ for(int j=2;j<=look;j++) if( Low[j]<Low[j+1] && Low[j]<Low[j-1]) return j; } return -1; }
+
+void ManageOpenPositions(){ for(int i=OrdersTotal()-1;i>=0;i--){ if(!OrderSelect(i, SELECT_BY_POS)) continue; if(OrderMagicNumber()!=Magic || OrderSymbol()!=Symbol()) continue;
+
+int type = OrderType(); double price = (type==OP_BUY? Bid:Ask);
+  double atr = GetATR(ATR_Period_M5);
+
+  // Cutloss cepat jika close lawan tembus MidBB M5
+  double mid = BB_M5_MAIN(20,1); // gunakan bar closed
+  if( (type==OP_BUY && Close[1]<mid) || (type==OP_SELL && Close[1]>mid) ){
+     CloseOrder(OrderTicket()); continue;
+  }
+
+  // MaxBarsHold
+  if(MaxBarsHold>0 && (TimeCurrent()-OrderOpenTime())/PeriodSeconds(PERIOD_M5) > MaxBarsHold){
+     CloseOrder(OrderTicket()); continue;
+  }
+
+  // Partial close di TP1
+  double tp1 = OrderTakeProfit();
+  if(tp1>0){
+     bool hit = (type==OP_BUY? (High[0]>=tp1) : (Low[0]<=tp1));
+     if(hit && OrderLots()>MarketInfo(Symbol(),MODE_MINLOT)){
+        double pct = 40.0; // default
+        if(StringFind(OrderComment(),"RE",0)==0) pct=PartialClosePct_Re;
+        if(StringFind(OrderComment(),"ZZL",0)==0) pct=PartialClosePct_ZZ;
+        if(StringFind(OrderComment(),"MO",0)==0) pct=PartialClosePct_Mo;
+        ClosePartial(OrderTicket(), pct);
+        // hapus TP agar trailing bekerja penuh
+        ModifySLTP(OrderTicket(), OrderStopLoss(), 0);
+     }
+  }
+
+  // Trailing ATR dinamis
+  double mult = ATR_TrailMult_Re;
+  if(StringFind(OrderComment(),"MO",0)==0) mult=ATR_TrailMult_Mom;
+  if(StringFind(OrderComment(),"ZZL",0)==0) mult=ATR_TrailMult_ZZL;
+
+  double trail = atr*mult;
+  double newSL;
+  if(type==OP_BUY){ newSL = price - trail; if(newSL>OrderStopLoss()) ModifySLTP(OrderTicket(), newSL, OrderTakeProfit()); }
+  if(type==OP_SELL){ newSL = price + trail; if(newSL<OrderStopLoss() || OrderStopLoss()==0) ModifySLTP(OrderTicket(), newSL, OrderTakeProfit()); }
+
+  // News: force SL+ jika profit
+  if(UseNewsFilter && ForceSLPlusOnNews && TradingPausedByNews()){
+     double be = OrderOpenPrice() + ((type==OP_BUY)? +1:-1)* (2*Pip());
+     if( (type==OP_BUY && price>OrderOpenPrice()) || (type==OP_SELL && price<OrderOpenPrice()) ){
+        if( (type==OP_BUY && (OrderStopLoss()<be)) || (type==OP_SELL && (OrderStopLoss()>be || OrderStopLoss()==0)) ){
+           ModifySLTP(OrderTicket(), be, OrderTakeProfit());
+        }
+     }
+  }
+
+} }
+
+//===================================================== //================  INIT / DEINIT / TICK  ============= //===================================================== int OnInit(){ dayStamp = DateOfDay(TimeCurrent()); dayStartEquity = AccountEquity(); consecLoss = 0; return(INIT_SUCCEEDED); }
+
+void OnDeinit(const int reason){ }
+
+void OnTick(){ // Hanya bekerja di M5 if(Period()!=PERIOD_M5) { Comment("Attach EA di M5."); return; }
+
+// Update akumulasi win/loss dari history UpdateWinLossCounters();
+
+// Entry & exit TryEntries(); ManageOpenPositions();
+
+if(ShowPanel) DrawPanel(); }
+
+void DrawPanel(){ string m = (Mode==0?"SAFE": Mode==1?"HYBRID": Mode==2?"AGGRESSIVE":"SUPER_AGG"); string txt; txt  = "EA AKSEL – BBMA Single-TF (M5)\n"; txt += "Mode: "+m+"  | Risk "+DoubleToString(RiskPerTradePct,1)+"%  | ZZL x"+DoubleToString(ZZLRiskMultiplier,1)+"\n"; txt += "DailyLossLimit: "+DoubleToString(MaxDailyLossPct,1)+"%  | ConsecLoss: "+IntegerToString(consecLoss)+"\n"; if(UseNewsFilter) txt += "News: PAUSE="+(TradingPausedByNews()?"YES":"NO")+"  ("+IntegerToString(MinutesBeforeNews)+"/"+IntegerToString(MinutesAfterNews)+")\n"; txt += "H1 Trend: "+(FilterTrendH1Up()?"UP":(FilterTrendH1Down()?"DOWN":"NEUTRAL"))+"  | ATR "+DoubleToString(GetATR(ATR_Period_M5),Digits()); Comment(txt); }
+
+//+------------------------------------------------------------------+ //|  END OF FILE                                                     | //+------------------------------------------------------------------+
+
